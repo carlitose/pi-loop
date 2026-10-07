@@ -1,0 +1,26 @@
+{
+  "name": "@carlitose86/pi-loop",
+  "version": "0.1.0",
+  "description": "/loop for Pi: repeat one instruction every turn, with an optional pause, until you stop it",
+  "keywords": ["pi-package", "pi", "pi-extension", "loop", "extension"],
+  "license": "MIT",
+  "author": "carlitose86",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/carlitose/pi-loop.git"
+  },
+  "type": "module",
+  "files": ["extensions/loop.ts", "README.md", "LICENSE"],
+  "pi": {
+    "extensions": ["./extensions/loop.ts"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "engines": {
+    "node": ">=22.6"
+  },
+  "scripts": {
+    "test": "node --experimental-strip-types --test extensions/loop.test.ts"
+  }
+}
