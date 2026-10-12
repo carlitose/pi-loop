@@ -1,6 +1,6 @@
 {
   "name": "@carlitose86/pi-loop",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "/loop for Pi: repeat one instruction every turn, with an optional pause, until you stop it",
   "keywords": ["pi-package", "pi", "pi-extension", "loop", "extension"],
   "license": "MIT",
