@@ -17,7 +17,8 @@
  *   is new; the same action, request or answer in other words is not. Measured on real
  *   sessions: a loop asking another agent the same question ran 90 rounds, and on a toy repo
  *   326 rounds in 12 minutes, each one rewording the last. A failed or unreadable check counts
- *   as new; PI_LOOP_NOVELTY=0 turns it off.
+ *   as new; PI_LOOP_NOVELTY=0 turns it off. Only runs a round started are compared: a turn
+ *   another extension starts in between (a reminder, a check) neither counts nor resets.
  * - A round due while a turn is running is queued as a follow-up.
  * - Headless (`pi -p "/loop ..."`), the command holds the process open until the loop stops.
  * - Nothing is persisted: a reload, resume, or new session starts without a loop.
@@ -92,7 +93,12 @@ interface ActiveLoop {
 }
 
 type Part = { type?: string; text?: string; name?: string; arguments?: Record<string, unknown> };
-type RoundMessage = { role?: string; content?: unknown };
+type RoundMessage = { role?: string; content?: unknown; customType?: string };
+
+/** Whether a run was started by one of this loop's rounds: its messages carry the round. */
+export function isLoopRound(messages: ReadonlyArray<RoundMessage>): boolean {
+	return messages.some((message) => message?.role === "custom" && message.customType === LOOP_MESSAGE);
+}
 
 /** What a round did and said: its tool calls and its closing text. */
 export function summarizeRound(messages: ReadonlyArray<RoundMessage>): string {
@@ -292,7 +298,12 @@ export default function loopExtension(pi: ExtensionAPI) {
 			return;
 		}
 		const active = loop;
-		const round = summarizeRound(event.messages as ReadonlyArray<RoundMessage>);
+		const runMessages = event.messages as ReadonlyArray<RoundMessage>;
+		if (!isLoopRound(runMessages)) {
+			schedule(ctx, active.pauseMs); // another extension's turn: not a round to compare
+			return;
+		}
+		const round = summarizeRound(runMessages);
 		const earlier = active.lastRound;
 		active.lastRound = round;
 		const repeat = earlier !== undefined && (await isRepeat(ctx, active.text, earlier, round));
