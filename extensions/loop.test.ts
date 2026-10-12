@@ -1,7 +1,17 @@
 import assert from "node:assert/strict";
 import { mock, test } from "node:test";
 
-import loopExtension, { NO_LOOP_TEXT, parseLoopArgs, RETRY_FLOOR_MS, roundText, unrecoverableKind } from "./loop.ts";
+import loopExtension, {
+	NO_LOOP_TEXT,
+	NOVELTY_SYSTEM,
+	parseLoopArgs,
+	parseNovelty,
+	RETRY_FLOOR_MS,
+	roundText,
+	setNoveltyBackend,
+	summarizeRound,
+	unrecoverableKind,
+} from "./loop.ts";
 
 type Handler = (event: unknown, ctx: unknown) => unknown;
 type Sent = { message: { customType: string; content: string; display: boolean }; options: unknown };
@@ -9,7 +19,7 @@ type Sent = { message: { customType: string; content: string; display: boolean }
 const assistant = (stopReason = "stop", extra: Record<string, unknown> = {}) => ({ role: "assistant", stopReason, ...extra });
 
 /** Fresh extension over a stub pi API. */
-function setup(opts: { idle?: boolean; hasUI?: boolean } = {}) {
+function setup(opts: { idle?: boolean; hasUI?: boolean; model?: unknown } = {}) {
 	const handlers = new Map<string, Handler>();
 	const commands = new Map<string, (args: string, ctx: unknown) => Promise<void>>();
 	const sent: Sent[] = [];
@@ -22,6 +32,7 @@ function setup(opts: { idle?: boolean; hasUI?: boolean } = {}) {
 		registerCommand: (name: string, spec: { handler: (args: string, ctx: unknown) => Promise<void> }) => commands.set(name, spec.handler),
 	} as never);
 	const ctx = {
+		model: opts.model,
 		hasUI: opts.hasUI ?? true,
 		isIdle: () => idle,
 		ui: {
@@ -202,4 +213,90 @@ test("holds a headless command open until the loop stops, pauses included", asyn
 	await handled;
 	assert.equal(settled, true);
 	write.mock.restore();
+});
+
+/** A round's assistant message: optional tool calls and a closing text. */
+const said = (text: string, tools: Array<[string, string]> = []) =>
+	assistant("stop", {
+		content: [...tools.map(([name, path]) => ({ type: "toolCall", name, arguments: { path } })), { type: "text", text }],
+	});
+
+/** Scripted novelty answers; records the prompts. */
+function novelty(answers: string[]) {
+	const prompts: Array<{ system: string; prompt: string }> = [];
+	setNoveltyBackend(async (_model, system, prompt) => {
+		prompts.push({ system, prompt });
+		const next = answers.shift();
+		if (next === undefined) throw new Error("no scripted answer");
+		return next;
+	});
+	return prompts;
+}
+
+test("reads what a round did and said, and the checker's answer", () => {
+	const round = summarizeRound([said("Asked the Main again.", [["edit", "OUTBOX.md"]]) as never]);
+	assert.equal(round, "tools: edit OUTBOX.md\ncloses with: Asked the Main again.");
+	assert.equal(summarizeRound([assistant() as never]), "tools: none\ncloses with: (nothing)");
+	assert.equal(parseNovelty('ok {"new": false}'), false);
+	assert.equal(parseNovelty('{"new": true}'), true);
+	assert.equal(parseNovelty('{"stops": true}'), undefined);
+	assert.equal(parseNovelty("no json"), undefined);
+});
+
+test("stops when two rounds in a row say the same thing", async (t) => {
+	t.after(() => setNoveltyBackend(null));
+	const prompts = novelty(['{"new": false}']);
+	const s = setup({ model: { id: "m" } });
+	await s.loop("ask the Main whom to check");
+	await s.agentEnd(said("Asked the Main in OUTBOX.md.", [["write", "OUTBOX.md"]]));
+	assert.equal(s.rounds().length, 2);
+	await s.agentEnd(said("Asked the Main again in OUTBOX.md (round 2).", [["edit", "OUTBOX.md"]]));
+	assert.equal(s.rounds().length, 2);
+	assert.equal(prompts.length, 1);
+	assert.equal(prompts[0].system, NOVELTY_SYSTEM);
+	assert.match(prompts[0].prompt, /INSTRUCTION: ask the Main whom to check/);
+	assert.match(prompts[0].prompt, /EARLIER ROUND:\ntools: write OUTBOX.md/);
+	assert.match(prompts[0].prompt, /LATER ROUND:\ntools: edit OUTBOX.md\ncloses with: Asked the Main again/);
+	const last = s.sent[s.sent.length - 1];
+	assert.match(last.message.content, /^Loop stopped: 2 rounds in a row said the same thing\. Run \/loop again to continue: ask the Main whom to check$/);
+	assert.deepEqual(last.options, { triggerTurn: false });
+	await s.loop();
+	assert.equal(s.lastNote()?.msg, NO_LOOP_TEXT);
+});
+
+test("a round with something new keeps the loop going", async (t) => {
+	t.after(() => setNoveltyBackend(null));
+	novelty(['{"new": true}', '{"new": true}', '{"new": false}']);
+	const s = setup({ model: { id: "m" } });
+	await s.loop("5s check the CI");
+	for (const text of ["CI at 40%", "CI at 70%", "CI green"]) {
+		await s.agentEnd(said(text));
+		assert.equal(s.sent.some((m) => m.message.content.startsWith("Loop stopped")), false);
+	}
+	await s.agentEnd(said("CI still green"));
+	assert.match(s.sent[s.sent.length - 1].message.content, /^Loop stopped: 2 rounds/);
+});
+
+test("a failed or unreadable check, no model, or PI_LOOP_NOVELTY=0 never stops the loop", async (t) => {
+	t.after(() => {
+		setNoveltyBackend(null);
+		delete process.env.PI_LOOP_NOVELTY;
+	});
+	const prompts = novelty(["no json"]);
+	const s = setup({ model: { id: "m" } });
+	await s.loop("fix what fails");
+	await s.agentEnd(said("same"));
+	await s.agentEnd(said("same"));
+	assert.match(s.lastNote()?.msg ?? "", /Loop novelty check skipped: unreadable answer/);
+	await s.agentEnd(said("same"));
+	assert.match(s.lastNote()?.msg ?? "", /Loop novelty check skipped: no scripted answer/);
+	process.env.PI_LOOP_NOVELTY = "0";
+	await s.agentEnd(said("same"));
+	assert.equal(prompts.length, 2);
+	assert.equal(s.rounds().length, 5);
+	const bare = setup();
+	await bare.loop("fix what fails");
+	await bare.agentEnd(said("same"));
+	await bare.agentEnd(said("same"));
+	assert.equal(bare.rounds().length, 3);
 });

@@ -12,6 +12,12 @@
  * - A round the user interrupts (Esc) stops the loop. An error the user has to fix
  *   (authentication, credits, context overflow, model unavailable) stops it once the run
  *   settles; a transient one retries after the pause, at least 30 seconds.
+ * - Two rounds in a row that say the same thing stop the loop. After each round the session
+ *   model compares it with the previous one: new information, a different result or progress
+ *   is new; the same action, request or answer in other words is not. Measured on real
+ *   sessions: a loop asking another agent the same question ran 90 rounds, and on a toy repo
+ *   326 rounds in 12 minutes, each one rewording the last. A failed or unreadable check counts
+ *   as new; PI_LOOP_NOVELTY=0 turns it off.
  * - A round due while a turn is running is queued as a follow-up.
  * - Headless (`pi -p "/loop ..."`), the command holds the process open until the loop stops.
  * - Nothing is persisted: a reload, resume, or new session starts without a loop.
@@ -25,6 +31,18 @@ export const LOOP_TEXT_MAX_CHARS = 4000;
 export const RETRY_FLOOR_MS = 30_000;
 export const NO_LOOP_TEXT = "No loop set. Usage: /loop [30s|5m|1h] <instruction>";
 const STOP_WORDS = new Set(["stop", "clear", "off", "reset", "none", "cancel"]);
+/** Rounds in a row that say the same thing before the loop stops by itself. */
+export const SAME_ROUNDS_TO_STOP = 2;
+const NOVELTY_TIMEOUT_MS = 60_000;
+const NOVELTY_MAX_TOKENS = 200;
+const ROUND_TEXT_CHARS = 3000;
+
+export const NOVELTY_SYSTEM =
+	"You compare two consecutive rounds of an instruction that repeats every turn. " +
+	"The later round is new when it brings something the earlier one did not: new information, " +
+	"a different result or state, or progress on the work. Repeating the same action, the same " +
+	"request or the same answer in other words is not new. " +
+	'Answer only with JSON: {"new": true|false}';
 const PAUSE = /^(\d+)(s|m|h)$/;
 const UNIT_MS = { s: 1000, m: 60_000, h: 3_600_000 } as const;
 
@@ -67,6 +85,69 @@ interface ActiveLoop {
 	startedAt: number;
 	/** Rounds sent so far. */
 	rounds: number;
+	/** The last finished round, as the novelty check reads it. */
+	lastRound?: string;
+	/** Finished rounds in a row that say the same thing (1 = the last one is new). */
+	sameRounds: number;
+}
+
+type Part = { type?: string; text?: string; name?: string; arguments?: Record<string, unknown> };
+type RoundMessage = { role?: string; content?: unknown };
+
+/** What a round did and said: its tool calls and its closing text. */
+export function summarizeRound(messages: ReadonlyArray<RoundMessage>): string {
+	const tools: string[] = [];
+	let closing = "";
+	for (const message of messages) {
+		if (message?.role !== "assistant" || !Array.isArray(message.content)) continue;
+		const parts = message.content as Part[];
+		for (const part of parts) {
+			if (part?.type !== "toolCall") continue;
+			const target = part.arguments?.path ?? part.arguments?.command ?? "";
+			tools.push(`${part.name ?? "tool"} ${String(target).slice(0, 120)}`.trim());
+		}
+		const text = parts.filter((part) => part?.type === "text").map((part) => part.text ?? "").join("").trim();
+		if (text) closing = text;
+	}
+	return `tools: ${tools.join("; ") || "none"}\ncloses with: ${closing.slice(-ROUND_TEXT_CHARS) || "(nothing)"}`;
+}
+
+export function noveltyPrompt(instruction: string, earlier: string, later: string): string {
+	return `INSTRUCTION: ${instruction}\n\nEARLIER ROUND:\n${earlier}\n\nLATER ROUND:\n${later}`;
+}
+
+/** true/false from the checker's answer; undefined when it cannot be read. */
+export function parseNovelty(raw: string): boolean | undefined {
+	const match = /\{[\s\S]*\}/.exec(raw);
+	if (!match) return undefined;
+	try {
+		const value = (JSON.parse(match[0]) as { new?: unknown }).new;
+		return typeof value === "boolean" ? value : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/** One tool-less completion: system + prompt -> reply text. Overridable for tests. */
+export type NoveltyBackend = (model: unknown, system: string, prompt: string, signal: AbortSignal) => Promise<string>;
+
+async function realBackend(): Promise<NoveltyBackend> {
+	// Loaded lazily: the tests run without Pi installed.
+	const { ModelRuntime } = await import("@earendil-works/pi-coding-agent");
+	const runtime = await ModelRuntime.create();
+	return async (model, system, prompt, signal) => {
+		const context = { systemPrompt: system, messages: [{ role: "user" as const, content: prompt, timestamp: Date.now() }] };
+		const reply = await runtime.completeSimple(model as never, context, { maxTokens: NOVELTY_MAX_TOKENS, signal });
+		if (reply.stopReason === "error" || reply.stopReason === "aborted") throw new Error(reply.errorMessage ?? `completion ${reply.stopReason}`);
+		return reply.content.map((part) => (part.type === "text" ? part.text : "")).join("");
+	};
+}
+
+let backend: Promise<NoveltyBackend> | null = null;
+
+/** Replace the novelty backend, or reset to the real runtime with null. Tests only. */
+export function setNoveltyBackend(fn: NoveltyBackend | null): void {
+	backend = fn ? Promise.resolve(fn) : null;
 }
 
 function statusText(loop: ActiveLoop | undefined): string {
@@ -160,7 +241,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 				return;
 			}
 			stop(ctx); // a new loop replaces the current one, releasing a headless caller
-			loop = { text, pauseMs, startedAt: Date.now(), rounds: 0 };
+			loop = { text, pauseMs, startedAt: Date.now(), rounds: 0, sameRounds: 0 };
 			tell(ctx, `Loop set${pauseMs > 0 ? ` (pause ${formatDuration(pauseMs)})` : ""}: ${text}`, "info");
 			sendRound(ctx);
 			// `pi -p` exits when the command returns, and a loop with pauses has idle gaps, so
@@ -179,7 +260,28 @@ export default function loopExtension(pi: ExtensionAPI) {
 		stop(ctx);
 	});
 
-	pi.on("agent_end", (event, ctx) => {
+	/** Whether `later` says the same thing as `earlier`; false when the check cannot run. */
+	async function isRepeat(ctx: ExtensionContext, instruction: string, earlier: string, later: string): Promise<boolean> {
+		const model = ctx.model;
+		if (process.env.PI_LOOP_NOVELTY === "0" || !model) return false;
+		try {
+			backend ??= realBackend().catch((error: unknown) => {
+				backend = null;
+				throw error;
+			});
+			const complete = await backend;
+			const deadline = AbortSignal.timeout(NOVELTY_TIMEOUT_MS);
+			const signal = ctx.signal ? AbortSignal.any([ctx.signal, deadline]) : deadline;
+			const answer = parseNovelty(await complete(model, NOVELTY_SYSTEM, noveltyPrompt(instruction, earlier, later), signal));
+			if (answer === undefined) throw new Error("unreadable answer");
+			return !answer;
+		} catch (error) {
+			tell(ctx, `Loop novelty check skipped: ${error instanceof Error ? error.message : String(error)}`, "warning");
+			return false;
+		}
+	}
+
+	pi.on("agent_end", async (event, ctx) => {
 		sessionCtx = ctx;
 		const messages = event.messages as ReadonlyArray<LastMessage>;
 		const last = [...messages].reverse().find((message) => message?.role === "assistant");
@@ -189,7 +291,20 @@ export default function loopExtension(pi: ExtensionAPI) {
 			tell(ctx, `Loop stopped by interrupt: ${stop(ctx)}`, "warning");
 			return;
 		}
-		schedule(ctx, loop.pauseMs);
+		const active = loop;
+		const round = summarizeRound(event.messages as ReadonlyArray<RoundMessage>);
+		const earlier = active.lastRound;
+		active.lastRound = round;
+		const repeat = earlier !== undefined && (await isRepeat(ctx, active.text, earlier, round));
+		if (loop !== active) return; // stopped or replaced during the check
+		active.sameRounds = repeat ? active.sameRounds + 1 : 1;
+		if (active.sameRounds >= SAME_ROUNDS_TO_STOP) {
+			const text = `Loop stopped: ${active.sameRounds} rounds in a row said the same thing. Run /loop again to continue: ${stop(ctx)}`;
+			send(text, { triggerTurn: false });
+			tell(ctx, text, "info");
+			return;
+		}
+		schedule(ctx, active.pauseMs);
 	});
 
 	pi.on("agent_settled", (_event, ctx) => {
