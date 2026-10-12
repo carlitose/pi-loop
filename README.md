@@ -37,7 +37,8 @@ Try it for one run without installing: `pi -e npm:@carlitose86/pi-loop`.
   the session model compares it with the previous one: new information, a different result or
   progress is new (`CI at 40%` then `CI at 70%`); the same action, request or answer in other
   words is not (asking another agent the same question again). The check is one short model
-  call per round; if it fails the loop goes on. `PI_LOOP_NOVELTY=0` turns it off. A waiting loop
+  call per round; if it fails the loop goes on. `PI_LOOP_NOVELTY=0` turns it off. Only rounds
+  are compared: a turn another extension starts in between (a reminder, a check) does not count. A waiting loop
   whose answer does not change (`CI still running`) stops too: run `/loop` again to resume.
 - A round that falls due while a turn is running is queued as a follow-up.
 - Headless, `pi -p "/loop ..."` keeps the process open until the loop stops.

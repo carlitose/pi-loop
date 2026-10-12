@@ -52,7 +52,11 @@ function setup(opts: { idle?: boolean; hasUI?: boolean; model?: unknown } = {}) 
 			assert.ok(handler, "loop extension did not register /loop");
 			return handler(args, ctx);
 		},
-		agentEnd: (message: unknown = assistant()) => on("agent_end")({ type: "agent_end", messages: [message] }, ctx),
+		agentEnd: (message: unknown = assistant(), before: unknown[] = []) =>
+			on("agent_end")({ type: "agent_end", messages: [...before, message] }, ctx),
+		/** A run started by a /loop round. */
+		roundEnd: (message: unknown) =>
+			on("agent_end")({ type: "agent_end", messages: [{ role: "custom", customType: "loop", content: "[loop, round N] x" }, message] }, ctx),
 		settled: () => on("agent_settled")({ type: "agent_settled" }, ctx),
 		sessionStart: () => on("session_start")({ type: "session_start", reason: "reload" }, ctx),
 		setIdle: (next: boolean) => {
@@ -248,9 +252,9 @@ test("stops when two rounds in a row say the same thing", async (t) => {
 	const prompts = novelty(['{"new": false}']);
 	const s = setup({ model: { id: "m" } });
 	await s.loop("ask the Main whom to check");
-	await s.agentEnd(said("Asked the Main in OUTBOX.md.", [["write", "OUTBOX.md"]]));
+	await s.roundEnd(said("Asked the Main in OUTBOX.md.", [["write", "OUTBOX.md"]]));
 	assert.equal(s.rounds().length, 2);
-	await s.agentEnd(said("Asked the Main again in OUTBOX.md (round 2).", [["edit", "OUTBOX.md"]]));
+	await s.roundEnd(said("Asked the Main again in OUTBOX.md (round 2).", [["edit", "OUTBOX.md"]]));
 	assert.equal(s.rounds().length, 2);
 	assert.equal(prompts.length, 1);
 	assert.equal(prompts[0].system, NOVELTY_SYSTEM);
@@ -270,10 +274,10 @@ test("a round with something new keeps the loop going", async (t) => {
 	const s = setup({ model: { id: "m" } });
 	await s.loop("5s check the CI");
 	for (const text of ["CI at 40%", "CI at 70%", "CI green"]) {
-		await s.agentEnd(said(text));
+		await s.roundEnd(said(text));
 		assert.equal(s.sent.some((m) => m.message.content.startsWith("Loop stopped")), false);
 	}
-	await s.agentEnd(said("CI still green"));
+	await s.roundEnd(said("CI still green"));
 	assert.match(s.sent[s.sent.length - 1].message.content, /^Loop stopped: 2 rounds/);
 });
 
@@ -285,18 +289,32 @@ test("a failed or unreadable check, no model, or PI_LOOP_NOVELTY=0 never stops t
 	const prompts = novelty(["no json"]);
 	const s = setup({ model: { id: "m" } });
 	await s.loop("fix what fails");
-	await s.agentEnd(said("same"));
-	await s.agentEnd(said("same"));
+	await s.roundEnd(said("same"));
+	await s.roundEnd(said("same"));
 	assert.match(s.lastNote()?.msg ?? "", /Loop novelty check skipped: unreadable answer/);
-	await s.agentEnd(said("same"));
+	await s.roundEnd(said("same"));
 	assert.match(s.lastNote()?.msg ?? "", /Loop novelty check skipped: no scripted answer/);
 	process.env.PI_LOOP_NOVELTY = "0";
-	await s.agentEnd(said("same"));
+	await s.roundEnd(said("same"));
 	assert.equal(prompts.length, 2);
 	assert.equal(s.rounds().length, 5);
 	const bare = setup();
 	await bare.loop("fix what fails");
-	await bare.agentEnd(said("same"));
-	await bare.agentEnd(said("same"));
+	await bare.roundEnd(said("same"));
+	await bare.roundEnd(said("same"));
 	assert.equal(bare.rounds().length, 3);
+});
+
+test("a turn another extension starts between rounds neither counts nor resets", async (t) => {
+	t.after(() => setNoveltyBackend(null));
+	const prompts = novelty(['{"new": false}']);
+	const s = setup({ model: { id: "m" } });
+	await s.loop("ask the Main whom to check");
+	await s.roundEnd(said("Asked the Main in OUTBOX.md."));
+	await s.agentEnd(said("I am not waiting: the question is in OUTBOX.md."), [{ role: "custom", customType: "block-check", content: "Block check: ..." }]);
+	assert.equal(prompts.length, 0);
+	await s.roundEnd(said("Asked the Main again in OUTBOX.md."));
+	assert.equal(prompts.length, 1);
+	assert.match(prompts[0].prompt, /EARLIER ROUND:\ntools: none\ncloses with: Asked the Main in OUTBOX\.md\./);
+	assert.match(s.sent[s.sent.length - 1].message.content, /^Loop stopped: 2 rounds/);
 });
